@@ -1,0 +1,221 @@
+-- ============================================================================
+-- DATA QUALITY TESTING — bronze.users_data
+-- ============================================================================
+-- Purpose: bridge between bronze and silver. Every test below was run against
+-- the raw bronze table to characterize the data BEFORE writing any silver
+-- transformation logic — confirming assumptions rather than guessing at them.
+--
+-- Each section documents: what was tested, what was found, and what decision
+-- (if any) that finding led to for the silver layer.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- 1. current_age — range, null check, internal consistency with birth_year
+-- ----------------------------------------------------------------------------
+
+SELECT MAX(current_age), MIN(current_age)
+FROM bronze.users_data;
+
+SELECT COUNT(*)
+FROM bronze.users_data
+WHERE current_age IS NULL;
+
+-- Internal consistency check: does birth_year + current_age land on a
+-- plausible, tightly-clustered "collection year" for the dataset? This is
+-- a more reliable anchor than assuming today's date, since this is a
+-- static historical snapshot (the dataset is understood to have been
+-- collected around the 2010 decade, consistent with the earliest
+-- transaction dates observed in bronze.transactions_data).
+SELECT id, current_age, birth_year,
+       birth_year + current_age AS cal_age
+FROM bronze.users_data;
+
+-- RESULT: Range and null checks came back clean — no missing values, no
+-- implausible ages. birth_year + current_age clusters tightly around a
+-- single implied collection year, consistent with the dataset's known
+-- 2010-decade timeframe, confirming current_age and birth_year agree
+-- with each other internally.
+-- DECISION: current_age carries forward as INT, untouched. Already a
+-- valid integer value with no transformation needed.
+
+
+-- ----------------------------------------------------------------------------
+-- 2. retirement_age — range and null check
+-- ----------------------------------------------------------------------------
+
+SELECT MIN(retirement_age), MAX(retirement_age)
+FROM bronze.users_data
+WHERE retirement_age IS NOT NULL;
+
+SELECT COUNT(*)
+FROM bronze.users_data
+WHERE retirement_age IS NULL;
+
+-- RESULT: Range is plausible, no nulls found.
+-- DECISION: retirement_age carries forward as INT, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 3. birth_year / birth_month — validity check
+-- ----------------------------------------------------------------------------
+
+SELECT birth_year, birth_month
+FROM bronze.users_data
+WHERE birth_year IS NULL
+   OR birth_year < 0
+   OR birth_month < 1
+   OR birth_month > 12;
+
+-- RESULT: Empty. No null birth years, no negative years, and every
+-- birth_month falls within the valid 1-12 range.
+-- DECISION: Both columns carry forward as INT, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 4. gender — distinct values, whitespace check
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT gender
+FROM bronze.users_data;
+
+SELECT gender
+FROM bronze.users_data
+WHERE gender != TRIM(gender);
+
+-- RESULT: Clean, limited set of distinct values. No leading/trailing
+-- whitespace found.
+-- DECISION: gender carries forward as TEXT, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 5. address — null, whitespace, and format check
+-- ----------------------------------------------------------------------------
+
+SELECT COUNT(*)
+FROM bronze.users_data
+WHERE address IS NULL;
+
+SELECT address
+FROM bronze.users_data
+WHERE address != TRIM(address);
+
+-- Sanity check: most addresses should start with a house number
+SELECT address
+FROM bronze.users_data
+WHERE address !~ '^[0-9]';
+
+-- RESULT: No nulls, no whitespace issues. address contains only a house
+-- number and street name (no embedded city/state/zip), so there is no
+-- multi-value field to decompose. Splitting into street_number /
+-- street_name was considered and rejected — neither has standalone
+-- analytical value for this project's goals, unlike the expires /
+-- acct_open_date month-year split, which directly enabled date-range
+-- querying.
+-- DECISION: address carries forward as a single TEXT column, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 6. latitude / longitude — null check, range/validity check
+-- ----------------------------------------------------------------------------
+
+SELECT COUNT(*)
+FROM bronze.users_data
+WHERE latitude IS NULL OR longitude IS NULL;
+
+SELECT MIN(latitude::NUMERIC), MAX(latitude::NUMERIC)
+FROM bronze.users_data;
+
+SELECT MIN(longitude::NUMERIC), MAX(longitude::NUMERIC)
+FROM bronze.users_data;
+
+-- RESULT: No nulls. Values fall within valid real-world coordinate ranges
+-- (latitude within ±90, longitude within ±180) and cast cleanly to NUMERIC
+-- for validation purposes without error.
+-- DECISION: latitude and longitude carry forward as TEXT, NOT cast to
+-- NUMERIC in the final silver table. Coordinates are not a numeric concept
+-- for this project's purposes — no arithmetic is performed on them, and
+-- TEXT avoids any risk of precision drift on the decimal values. The
+-- NUMERIC cast above was used only to validate the range; it is not the
+-- final stored type.
+
+
+-- ----------------------------------------------------------------------------
+-- 7. per_capita_income — $ prefix, comma check, null check
+-- ----------------------------------------------------------------------------
+
+SELECT TRIM(REPLACE(per_capita_income, '$', '')) AS per_capita_income
+FROM bronze.users_data;
+
+SELECT per_capita_income
+FROM bronze.users_data
+WHERE per_capita_income LIKE '%,%';
+
+SELECT COUNT(*)
+FROM bronze.users_data
+WHERE per_capita_income IS NULL;
+
+-- RESULT: Raw value has a literal $ prefix, same pattern as credit_limit
+-- and amount elsewhere in this pipeline. No comma thousands-separators
+-- found, no nulls.
+-- DECISION: Strip the $ and cast to NUMERIC — safe and lossless once
+-- commas are confirmed absent.
+-- Final silver expression:
+--   CAST(TRIM(REPLACE(per_capita_income, '$', '')) AS NUMERIC) AS per_capita_income
+
+
+-- ----------------------------------------------------------------------------
+-- 8. yearly_income — comma check
+-- ----------------------------------------------------------------------------
+
+SELECT yearly_income
+FROM bronze.users_data
+WHERE yearly_income LIKE '%,%';
+
+-- RESULT: No commas found. Same $ prefix pattern as per_capita_income.
+-- DECISION: Strip the $ and cast to NUMERIC.
+-- Final silver expression:
+--   CAST(TRIM(REPLACE(yearly_income, '$', '')) AS NUMERIC) AS yearly_income
+
+
+-- ----------------------------------------------------------------------------
+-- 9. total_debt — comma check
+-- ----------------------------------------------------------------------------
+
+SELECT total_debt
+FROM bronze.users_data
+WHERE total_debt LIKE '%,%';
+
+-- RESULT: No commas found. Same $ prefix pattern as the other money columns.
+-- DECISION: Strip the $ and cast to NUMERIC.
+-- Final silver expression:
+--   CAST(TRIM(REPLACE(total_debt, '$', '')) AS NUMERIC) AS total_debt
+
+
+-- ----------------------------------------------------------------------------
+-- 10. credit_score / num_credit_cards — already INT in bronze, carried forward
+-- ----------------------------------------------------------------------------
+-- Both columns were confirmed to already be valid, plausible integer
+-- values (credit_score within standard scoring range, num_credit_cards
+-- non-negative) with no transformation required.
+-- DECISION: Both carry forward as INT, untouched.
+
+
+-- ============================================================================
+-- SUMMARY — bronze.users_data → silver.users
+-- ============================================================================
+-- id                  -> PRIMARY KEY, untouched
+-- current_age         -> untouched (already valid INT, cross-checked against birth_year)
+-- retirement_age      -> untouched (already valid INT)
+-- birth_year          -> untouched (already valid INT)
+-- birth_month         -> untouched (already valid INT, 1-12 range confirmed)
+-- gender              -> untouched (clean)
+-- address             -> untouched (single atomic value, no decomposition needed)
+-- latitude            -> untouched (stays TEXT, not a numeric concept)
+-- longitude           -> untouched (stays TEXT, not a numeric concept)
+-- per_capita_income   -> $ stripped, cast to NUMERIC
+-- yearly_income       -> $ stripped, cast to NUMERIC
+-- total_debt          -> $ stripped, cast to NUMERIC
+-- credit_score        -> untouched (already valid INT)
+-- num_credit_cards    -> untouched (already valid INT)
+-- ============================================================================
