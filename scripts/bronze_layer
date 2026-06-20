@@ -1,0 +1,150 @@
+-- ============================================================================
+-- BRONZE LAYER SETUP — Finance Fraud Detection Pipeline
+-- ============================================================================
+-- Source: computingvictor/transactions-fraud-datasets (Kaggle)
+-- Files: cards_data.csv, users_data.csv, transactions_data.csv
+--
+-- Purpose: Bronze is a 1:1 mirror of the raw source CSVs. No cleaning,
+-- no type conversion beyond what is needed to load the data WITHOUT altering
+-- the underlying value, and no normalization logic. Bronze exists to answer
+-- one question only: "what did the source file actually contain?"
+--
+-- This script is intentionally DESTRUCTIVE (drops and rebuilds everything).
+-- That is a deliberate dev-reset pattern, not an oversight — see the note
+-- at the bottom of this file for why that's appropriate here but would NOT
+-- be appropriate in a production or streaming context.
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- SCHEMA SETUP
+-- ----------------------------------------------------------------------------
+-- Drop all three medallion schemas (CASCADE removes any tables/objects
+-- inside them too, so this can be re-run freely during development without
+-- manually cleaning up leftover tables from a previous attempt).
+DROP SCHEMA IF EXISTS bronze CASCADE;
+DROP SCHEMA IF EXISTS silver CASCADE;
+DROP SCHEMA IF EXISTS gold CASCADE;
+
+-- Recreate empty schemas for all three layers up front. Bronze tables are
+-- created and loaded in this script; silver/gold are populated by their
+-- own dedicated scripts later in the pipeline.
+CREATE SCHEMA bronze;
+CREATE SCHEMA silver;
+CREATE SCHEMA gold;
+
+-- ----------------------------------------------------------------------------
+-- BRONZE TABLE DEFINITIONS
+-- ----------------------------------------------------------------------------
+-- Typing rule applied consistently across all three tables:
+--   - TEXT for any column whose raw value would need to be altered
+--     (stripped, reformatted, reparsed) to load into a "proper" type
+--     (e.g. "$24295" -> NUMERIC, "12/2022" -> DATE), or for any column
+--     that is not a numeric CONCEPT even though it looks numeric
+--     (IDs, card numbers, CVVs, zip codes — no math is ever performed
+--     on these, and leading zeros / exact digit strings must be preserved).
+--   - A native type (INT, TIMESTAMP) ONLY when the raw CSV value is
+--     ALREADY valid input for that type with zero transformation
+--     required (e.g. "2" -> INT, "2010-01-01 00:01:00" -> TIMESTAMP).
+-- This keeps bronze honest: every native-typed column here could be
+-- loaded by COPY with no risk of silently changing the source value.
+
+CREATE TABLE bronze.cards_data (
+    id                      TEXT,   -- card identifier (not a numeric concept)
+    client_id               TEXT,   -- FK to users_data.id (kept TEXT, no enforcement in bronze)
+    card_brand              TEXT,
+    card_type               TEXT,
+    card_number              TEXT,   -- never numeric: precision/leading-zero risk + sensitive data
+    expires                  TEXT,   -- raw format is MM/YYYY, not a valid DATE on its own
+    cvv                      TEXT,   -- never numeric, same reasoning as card_number
+    has_chip                 TEXT,   -- raw value is "YES"/"NO" string; boolean cast is a Silver job
+    num_cards_issued         INT,    -- raw value is already valid integer text, no transformation needed
+    credit_limit             TEXT,   -- raw value has a literal "$" prefix (e.g. "$24295") — not valid NUMERIC input as-is
+    acct_open_date           TEXT,   -- raw format is MM/YYYY, not a valid DATE on its own
+    year_pin_last_changed    INT,    -- raw value is already valid integer text, no transformation needed
+    card_on_dark_web         TEXT    -- raw value is "Yes"/"No" string; boolean cast is a Silver job
+);
+
+CREATE TABLE bronze.users_data (
+    id                  TEXT,   -- user identifier (not a numeric concept)
+    current_age         INT,    -- already valid integer text
+    retirement_age       INT,    -- already valid integer text
+    birth_year           INT,    -- already valid integer text
+    birth_month          INT,    -- already valid integer text
+    gender               TEXT,
+    address              TEXT,
+    latitude             TEXT,   -- not a numeric concept at bronze: no math performed, exact source precision preserved
+    longitude            TEXT,   -- same reasoning as latitude
+    per_capita_income    TEXT,   -- raw value has a literal "$" prefix, same issue as credit_limit
+    yearly_income        TEXT,   -- raw value has a literal "$" prefix
+    total_debt           TEXT,   -- raw value has a literal "$" prefix
+    credit_score         INT,    -- already valid integer text
+    num_credit_cards     INT     -- already valid integer text
+);
+
+CREATE TABLE bronze.transactions_data (
+    id               TEXT,        -- transaction identifier
+    date             TIMESTAMP,   -- raw value "2010-01-01 00:01:00" is already valid ISO timestamp text — native load, zero transformation
+    client_id        TEXT,        -- FK to users_data.id
+    card_id          TEXT,        -- FK to cards_data.id
+    amount           TEXT,        -- raw value has a literal "$" prefix and can be negative (e.g. "$-77.00") — not valid NUMERIC input as-is
+    use_chip         TEXT,
+    merchant_id      TEXT,
+    merchant_city    TEXT,
+    merchant_state   TEXT,
+    zip              TEXT,        -- not a numeric concept: leading zeros matter, no math performed
+    mcc              TEXT,
+    errors           TEXT         -- nullable; populated only when a transaction had an error code
+);
+
+-- ----------------------------------------------------------------------------
+-- LOAD DATA
+-- ----------------------------------------------------------------------------
+-- Straight COPY from the raw CSVs, no transformation applied at load time.
+-- HEADER tells Postgres to skip the first row (column names) in each file.
+
+COPY bronze.cards_data
+FROM '/tmp/money/cards_data.csv'
+DELIMITER ','
+CSV HEADER;
+
+COPY bronze.users_data
+FROM '/tmp/money/users_data.csv'
+DELIMITER ','
+CSV HEADER;
+
+COPY bronze.transactions_data
+FROM '/tmp/money/transactions_data.csv'
+DELIMITER ','
+CSV HEADER;
+
+-- ----------------------------------------------------------------------------
+-- VERIFICATION
+-- ----------------------------------------------------------------------------
+-- Sanity checks after load: confirm row counts are non-zero and that no
+-- values were silently altered on the way in (e.g. "$" still present on
+-- amount, full HH:MM:SS precision retained on date).
+
+SELECT COUNT(*) FROM bronze.cards_data;
+SELECT COUNT(*) FROM bronze.users_data;
+SELECT COUNT(*) FROM bronze.transactions_data;
+
+SELECT * FROM bronze.transactions_data LIMIT 5;
+
+-- ----------------------------------------------------------------------------
+-- NOTE ON DESTRUCTIVE DESIGN (DROP SCHEMA ... CASCADE)
+-- ----------------------------------------------------------------------------
+-- This script is safe to re-run any number of times because the source
+-- data is three STATIC CSV snapshots that do not change or grow over time.
+-- Destroy-and-rebuild guarantees an identical, correct end state on every run.
+--
+-- This pattern is NOT appropriate for a real-world incremental or streaming
+-- ingestion pipeline, where bronze would instead need to be APPEND-ONLY:
+--   - CREATE TABLE IF NOT EXISTS instead of DROP + CREATE
+--   - Metadata columns such as source_file and ingested_at to audit what
+--     was loaded and when
+--   - A UNIQUE constraint on the natural id column, paired with
+--     INSERT ... ON CONFLICT (id) DO NOTHING, to make repeated loads
+--     idempotent instead of duplicating rows
+-- DROP SCHEMA ... CASCADE is a development-reset tool, not a production
+-- ingestion pattern — it would destroy live data on every run.
+-- ============================================================================
