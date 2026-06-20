@@ -1,0 +1,82 @@
+-- ============================================================================
+-- SILVER TRANSFORMATION SOURCE — bronze.users_data -> silver.users
+-- ============================================================================
+-- This is the SELECT statement that populates silver.users. Every column
+-- below reflects a tested, documented decision — see
+-- users_data_quality_tests.sql for the full test history and reasoning
+-- behind each call.
+--
+-- This query is intended to run inside the silver load procedure as:
+--   INSERT INTO silver.users (...)
+--   SELECT ... (this query)
+--   FROM bronze.users_data;
+-- ============================================================================
+
+SELECT 
+    id,
+    -- Passed uniqueness check (no duplicates, no nulls) -> PRIMARY KEY in
+    -- silver.users. This is the root table — referenced by silver.cards
+    -- and silver.transactions, references nothing itself.
+
+    current_age,
+    -- Passed range and null checks. Cross-checked against birth_year
+    -- (birth_year + current_age clusters tightly around a single implied
+    -- collection year, consistent with the dataset's known 2010-decade
+    -- timeframe) confirming internal consistency. Already a valid INT,
+    -- carries forward untouched.
+
+    retirement_age,
+    -- Passed range and null checks. Already a valid INT, untouched.
+
+    birth_year,
+    -- Passed validity check (no nulls, no negative years). Already a
+    -- valid INT, untouched.
+
+    birth_month,
+    -- Passed validity check (every value falls within the valid 1-12
+    -- range). Already a valid INT, untouched.
+
+    gender,
+    -- Passed checks: clean, limited set of distinct values, no unwanted
+    -- whitespace. Carries forward as TEXT, untouched.
+
+    address,
+    -- Passed checks: no nulls, no whitespace issues. Contains only a
+    -- house number and street name (no embedded city/state/zip), so
+    -- there is no multi-value field to decompose. Splitting into
+    -- street_number / street_name was considered and rejected — neither
+    -- has standalone analytical value for this project's goals. Carries
+    -- forward as a single TEXT column.
+
+    latitude,
+    -- Passed checks: no nulls, values fall within valid real-world
+    -- coordinate bounds (±90). Stays TEXT, NOT cast to NUMERIC — not a
+    -- numeric concept for this project's purposes, no arithmetic is
+    -- performed on it, and TEXT avoids any risk of precision drift on
+    -- the decimal value.
+
+    longitude,
+    -- Same reasoning and treatment as latitude. Passed checks (±180
+    -- bounds, no nulls). Stays TEXT.
+
+    CAST(TRIM(REPLACE(per_capita_income, '$', '')) AS NUMERIC) AS per_capita_income,
+    -- Raw value has a literal $ prefix. No comma thousands-separators
+    -- found, so $ is stripped and the result cast to NUMERIC.
+
+    CAST(TRIM(REPLACE(yearly_income, '$', '')) AS NUMERIC) AS yearly_income,
+    -- Same $ prefix pattern and treatment as per_capita_income. No commas
+    -- found.
+
+    CAST(TRIM(REPLACE(total_debt, '$', '')) AS NUMERIC) AS total_debt,
+    -- Same $ prefix pattern and treatment as the other two money columns.
+    -- No commas found.
+
+    credit_score,
+    -- Passed range check (consistent with standard credit score scales)
+    -- and null check. Already a valid INT, untouched.
+
+    num_credit_cards
+    -- Passed range check (non-negative values) and null check. Already a
+    -- valid INT, untouched.
+
+FROM bronze.users_data;
