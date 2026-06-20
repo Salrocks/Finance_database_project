@@ -1,0 +1,54 @@
+CREATE TABLE IF NOT EXISTS silver.users_data(
+    id                  TEXT PRIMARY KEY,
+    current_age         INT,
+    retirement_age      INT,
+    birth_year          INT,
+    birth_month         INT,
+    gender              TEXT,
+    address             TEXT,
+    latitude            TEXT,
+    longitude           TEXT,
+    per_capita_income   NUMERIC,
+    yearly_income       NUMERIC,
+    total_debt          NUMERIC,
+    credit_score        INT,
+    num_credit_cards    INT
+);
+
+CREATE TABLE IF NOT EXISTS silver.cards_data (
+    id                      TEXT PRIMARY KEY,
+    client_id               TEXT NOT NULL REFERENCES silver.users_data(id),
+    card_brand              TEXT,
+    card_type               TEXT,
+    card_number             TEXT,
+    expire_month            INT,
+    expire_year             INT,
+    cvv                     TEXT,
+    has_chip                BOOLEAN,
+    num_cards_issued        INT,
+    credit_limit            NUMERIC,
+    acct_open_month         INT,
+    acct_open_year          INT,
+    year_pin_last_changed   INT,
+    card_on_dark_web        BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS silver.transactions_data (
+    id               TEXT PRIMARY KEY,
+    date             TIMESTAMP,
+    client_id        TEXT NOT NULL REFERENCES silver.users_data(id),
+    card_id          TEXT NOT NULL REFERENCES silver.cards_data(id),
+    amount           NUMERIC,
+    use_chip         TEXT,
+    merchant_id      TEXT,
+    merchant_city    TEXT,
+    merchant_state   TEXT,
+    zip_code         TEXT,
+    mcc              TEXT,
+    had_errors       BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS silver.transaction_errors (
+    transaction_id   TEXT NOT NULL REFERENCES silver.transactions_data(id),
+    error_type       TEXT NOT NULL
+);
