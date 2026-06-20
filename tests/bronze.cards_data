@@ -1,0 +1,319 @@
+-- ============================================================================
+-- DATA QUALITY TESTING — bronze.cards_data
+-- ============================================================================
+-- Purpose: bridge between bronze and silver. Every test below was run against
+-- the raw bronze table to characterize the data BEFORE writing any silver
+-- transformation logic — confirming assumptions rather than guessing at them.
+--
+-- Each section documents: what was tested, what was found, and what decision
+-- (if any) that finding led to for the silver layer.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- 1. PRIMARY KEY CANDIDATES — uniqueness check across all three bronze tables
+-- ----------------------------------------------------------------------------
+-- Confirms `id` is unique and non-null in each table before promoting it to
+-- a real PRIMARY KEY in silver. An empty result = no duplicates, no nulls
+-- (Postgres groups all NULLs together under GROUP BY, so a NULL-only group
+-- would also surface here as a row with COUNT(*) > 1 if multiple NULLs exist).
+
+SELECT id, COUNT(*) AS unique_value
+FROM bronze.cards_data
+GROUP BY id
+HAVING COUNT(*) != 1;
+
+SELECT id, COUNT(*) AS unique_value
+FROM bronze.users_data
+GROUP BY id
+HAVING COUNT(*) != 1;
+
+SELECT id, COUNT(*) AS unique_value
+FROM bronze.transactions_data
+GROUP BY id
+HAVING COUNT(*) != 1;
+
+-- RESULT: All three returned empty. id is unique and non-null in all three
+-- bronze tables.
+-- DECISION: id becomes PRIMARY KEY in silver.users, silver.cards, and
+-- silver.transactions.
+
+
+-- ----------------------------------------------------------------------------
+-- 2. FOREIGN KEY VALIDITY — client_id null check
+-- ----------------------------------------------------------------------------
+-- Confirms every card has SOME client_id value before checking whether that
+-- value actually points to a real customer (a separate orphan check, below).
+
+SELECT client_id
+FROM bronze.cards_data
+WHERE client_id IS NULL;
+
+-- RESULT: Empty. No card is missing a client_id.
+-- DECISION: client_id is safe to declare NOT NULL in silver.cards, pending
+-- the orphan check confirming referential integrity against silver.users.
+
+
+-- ----------------------------------------------------------------------------
+-- 3. card_brand — formatting and distinct value check
+-- ----------------------------------------------------------------------------
+
+SELECT card_brand
+FROM bronze.cards_data
+WHERE TRIM(card_brand) != card_brand;
+
+SELECT DISTINCT card_brand
+FROM bronze.cards_data;
+
+-- RESULT: No leading/trailing whitespace found. Distinct values are clean.
+-- DECISION: No transformation needed. card_brand carries forward as TEXT.
+
+
+-- ----------------------------------------------------------------------------
+-- 4. card_type — formatting and distinct value check
+-- ----------------------------------------------------------------------------
+
+SELECT card_type
+FROM bronze.cards_data
+WHERE TRIM(card_type) != card_type;
+
+SELECT DISTINCT card_type
+FROM bronze.cards_data;
+
+-- RESULT: Three clean values found — Credit, Debit, Debit (Prepaid). No
+-- whitespace issues. "Debit (Prepaid)" is a subtype of Debit, not a fourth
+-- independent category.
+-- DECISION: Keep card_type as a single TEXT column with all three values
+-- as-is. Not split into card_type + is_prepaid — the prepaid distinction is
+-- a minor attribute, not a structurally important dimension for this
+-- project's analytical goals, and a direct WHERE filter answers any
+-- prepaid-specific question without requiring normalization.
+
+
+-- ----------------------------------------------------------------------------
+-- 5. card_number — duplicate check and length-vs-brand consistency
+-- ----------------------------------------------------------------------------
+
+SELECT card_number, COUNT(*) AS duplicates_card_num
+FROM bronze.cards_data
+GROUP BY card_number
+HAVING COUNT(*) != 1;
+
+-- Length consistency per brand (e.g. Amex = 15 digits, Visa/Mastercard = 16)
+SELECT *
+FROM (
+    SELECT
+        card_brand,
+        LENGTH(card_number) AS len,
+        ROUND(AVG(LENGTH(card_number)) OVER (PARTITION BY card_brand), 0) AS brand_average
+    FROM bronze.cards_data
+) sub
+WHERE len != brand_average;
+
+-- RESULT: No duplicate card numbers. Length is consistent within each brand.
+-- DECISION: card_number stays TEXT, untouched — not a numeric concept,
+-- never used in arithmetic, and leading-digit precision must be preserved
+-- exactly as-is regardless.
+
+
+-- ----------------------------------------------------------------------------
+-- 6. expires — MM/YYYY format, no day component
+-- ----------------------------------------------------------------------------
+
+SELECT
+    expires,
+    SPLIT_PART(expires, '/', 1) AS expire_month,
+    SPLIT_PART(expires, '/', 2) AS expire_year
+FROM bronze.cards_data;
+
+-- FINDING: Raw value is MM/YYYY text with no day component at all.
+-- DECISION: Split into two INT columns (expire_month, expire_year) rather
+-- than parsed into a DATE. Constructing a DATE would require fabricating a
+-- day value that was never present in the source (e.g. defaulting to the
+-- 1st or last day of the month). Splitting preserves exactly the
+-- granularity that exists in the data with no invented information.
+-- Final silver expression:
+--   CAST(SPLIT_PART(expires, '/', 1) AS INT) AS expire_month,
+--   CAST(SPLIT_PART(expires, '/', 2) AS INT) AS expire_year
+
+
+-- ----------------------------------------------------------------------------
+-- 7. cvv — length, character validity, null check, brand cross-check
+-- ----------------------------------------------------------------------------
+
+-- Length distribution
+SELECT LENGTH(cvv), COUNT(*)
+FROM bronze.cards_data
+GROUP BY LENGTH(cvv)
+ORDER BY LENGTH(cvv);
+
+-- Duplicate (cvv, card_number) pairs
+SELECT DISTINCT cvv, card_number, COUNT(*) AS duplicates
+FROM bronze.cards_data
+GROUP BY cvv, card_number
+HAVING COUNT(*) > 1;
+
+-- Non-numeric characters
+SELECT cvv
+FROM bronze.cards_data
+WHERE cvv !~ '^[0-9]+$';
+
+-- Null check
+SELECT COUNT(*)
+FROM bronze.cards_data
+WHERE cvv IS NULL;
+
+-- Length vs. brand standard (Amex = 4 digits, all others = 3 digits)
+SELECT card_brand, LENGTH(cvv) AS cvv_length, COUNT(*)
+FROM bronze.cards_data
+GROUP BY card_brand, cvv_length
+ORDER BY card_brand, cvv_length;
+
+-- Isolate the short values
+SELECT cvv, LENGTH(cvv)
+FROM bronze.cards_data
+WHERE LENGTH(cvv) IN (1, 2);
+
+-- RESULT: All values are purely numeric (no letters/symbols), no nulls, no
+-- duplicate (cvv, card_number) pairs. However, a subset of records have
+-- 1- or 2-digit cvv values — inconsistent with the standard of 3 digits
+-- (Visa/Mastercard/Discover) or 4 digits (Amex), confirmed against
+-- card_brand in this dataset.
+--
+-- DECISION — escalated as a management-level question, not resolved
+-- silently in transformation logic:
+-- The source data offers no way to determine which digit(s) were lost or
+-- what their value would have been. Padding with a leading zero (or any
+-- digit) would fabricate data rather than clean it — uniqueness checks
+-- (e.g. no duplicate (cvv, card_number) pairs after padding) do NOT make
+-- a fabricated digit accurate; they only confirm the padded value wouldn't
+-- collide with another row, which is an unrelated property.
+-- FINAL CALL: cvv is carried forward into silver UNMODIFIED. The length
+-- inconsistency is documented as a known data quality limitation of the
+-- source (likely an artifact of this being a synthetic dataset).
+--
+-- HYPOTHETICAL — NOT IMPLEMENTED:
+-- If management had instead decided to standardize cvv length, the
+-- transformation would have used a brand-aware LPAD:
+--   CASE
+--       WHEN card_brand = 'Amex' THEN LPAD(cvv, 4, '0')
+--       ELSE LPAD(cvv, 3, '0')
+--   END
+-- This was deliberately not implemented, since it would fabricate the
+-- missing digit(s) rather than recover them.
+
+
+-- ----------------------------------------------------------------------------
+-- 8. has_chip — boolean-as-text check
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT has_chip
+FROM bronze.cards_data;
+
+-- RESULT: Only two values present — YES / NO.
+-- DECISION: Cast to BOOLEAN in silver.
+-- Final silver expression:
+--   CASE WHEN has_chip = 'YES' THEN TRUE ELSE FALSE END AS has_chip
+
+
+-- ----------------------------------------------------------------------------
+-- 9. num_cards_issued — distinct value sanity check
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT num_cards_issued
+FROM bronze.cards_data;
+
+-- RESULT: Clean integer values, already valid as INT with no transformation
+-- needed (consistent with the bronze typing decision).
+-- DECISION: Carries forward as INT, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 10. credit_limit — $ prefix removal, comma check, numeric cast
+-- ----------------------------------------------------------------------------
+
+SELECT credit_limit
+FROM bronze.cards_data;
+
+-- Check for thousands-separator commas before casting
+SELECT credit_limit
+FROM bronze.cards_data
+WHERE credit_limit LIKE '%,%';
+
+SELECT
+    credit_limit,
+    CAST(TRIM(REPLACE(credit_limit, '$', '')) AS NUMERIC) AS new_limit
+FROM bronze.cards_data;
+
+-- RESULT: No values contain commas. $ prefix removed cleanly, casts to
+-- NUMERIC without error.
+-- DECISION: NUMERIC (unconstrained, no precision/scale) chosen over FLOAT
+-- (silently rounds) or DECIMAL(10,2) (assumes a scale not verified across
+-- every row) — consistent with how every money column on this project has
+-- been typed.
+
+
+-- ----------------------------------------------------------------------------
+-- 11. acct_open_date — MM/YYYY format, no day component
+-- ----------------------------------------------------------------------------
+
+SELECT
+    acct_open_date,
+    SPLIT_PART(acct_open_date, '/', 1) AS acct_open_month,
+    SPLIT_PART(acct_open_date, '/', 2) AS acct_open_year
+FROM bronze.cards_data;
+
+-- FINDING: Same MM/YYYY format and missing-day problem as expires.
+-- DECISION: Same resolution as expires, for consistency across both
+-- date-like columns — split into two INT columns rather than fabricating
+-- a day to build a DATE.
+-- Final silver expression:
+--   CAST(SPLIT_PART(acct_open_date, '/', 1) AS INT) AS acct_open_month,
+--   CAST(SPLIT_PART(acct_open_date, '/', 2) AS INT) AS acct_open_year
+
+
+-- ----------------------------------------------------------------------------
+-- 12. year_pin_last_changed — distinct value sanity check
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT year_pin_last_changed
+FROM bronze.cards_data;
+
+-- RESULT: Clean integer year values, already valid as INT.
+-- DECISION: Carries forward as INT, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 13. card_on_dark_web — boolean-as-text check, formatting check
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT card_on_dark_web
+FROM bronze.cards_data;
+
+SELECT card_on_dark_web
+FROM bronze.cards_data
+WHERE card_on_dark_web != TRIM(card_on_dark_web);
+
+-- RESULT: Only Yes / No values present, no whitespace issues.
+-- DECISION: Cast to BOOLEAN in silver, same treatment as has_chip.
+-- Final silver expression:
+--   CASE WHEN card_on_dark_web = 'Yes' THEN TRUE ELSE FALSE END AS card_on_dark_web
+
+
+-- ============================================================================
+-- SUMMARY — bronze.cards_data → silver.cards
+-- ============================================================================
+-- id                    -> PRIMARY KEY, untouched
+-- client_id             -> FOREIGN KEY -> silver.users.id, untouched
+-- card_brand            -> untouched (clean)
+-- card_type             -> untouched (clean, kept as single column)
+-- card_number           -> untouched (not a numeric concept)
+-- expires               -> split into expire_month, expire_year (INT)
+-- cvv                   -> untouched (documented length inconsistency, no fabrication)
+-- has_chip              -> cast to BOOLEAN
+-- num_cards_issued      -> untouched (already valid INT)
+-- credit_limit          -> $ stripped, cast to NUMERIC
+-- acct_open_date        -> split into acct_open_month, acct_open_year (INT)
+-- year_pin_last_changed -> untouched (already valid INT)
+-- card_on_dark_web      -> cast to BOOLEAN
+-- ============================================================================
