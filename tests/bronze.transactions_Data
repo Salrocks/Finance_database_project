@@ -1,0 +1,258 @@
+-- ============================================================================
+-- DATA QUALITY TESTING — bronze.transactions_data
+-- ============================================================================
+-- Purpose: bridge between bronze and silver. Every test below was run against
+-- the raw bronze table to characterize the data BEFORE writing any silver
+-- transformation logic — confirming assumptions rather than guessing at them.
+--
+-- Each section documents: what was tested, what was found, and what decision
+-- (if any) that finding led to for the silver layer.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- 1. id — primary key candidate, uniqueness check
+-- ----------------------------------------------------------------------------
+
+SELECT id, COUNT(*)
+FROM bronze.transactions_data
+GROUP BY id
+HAVING COUNT(*) > 1;
+
+-- RESULT: Empty. id is unique across every row.
+-- DECISION: id becomes PRIMARY KEY in silver.transactions.
+
+
+-- ----------------------------------------------------------------------------
+-- 2. date — null check, range check, granularity check
+-- ----------------------------------------------------------------------------
+
+SELECT COUNT(*)
+FROM bronze.transactions_data
+WHERE date IS NULL;
+
+SELECT MIN(date) AS earliest, MAX(date) AS latest
+FROM bronze.transactions_data;
+
+-- (Seconds-distribution check, run separately) — every row's seconds
+-- component is 0; true precision is minute-level, not second-level.
+
+-- RESULT: No nulls. Range is plausible (no epoch-default or future-dated
+-- rows). All timestamps carry :00 seconds with no exceptions — the source
+-- data's real granularity is minute-level despite the TIMESTAMP type.
+-- DECISION: date carries forward as TIMESTAMP, untouched. No transformation
+-- applied — there is nothing to fix, since no second-level information was
+-- ever present to lose. Documented as a known precision limitation: any
+-- downstream analysis assuming sub-minute precision (e.g. flagging
+-- near-simultaneous transactions) should account for this.
+
+
+-- ----------------------------------------------------------------------------
+-- 3. amount — $ prefix, negative values
+-- ----------------------------------------------------------------------------
+
+SELECT amount
+FROM bronze.transactions_data;
+
+-- FINDING: Raw value has a literal $ prefix (e.g. "$14.57") and can be
+-- negative (e.g. "$-77.00"). Negative values are interpreted as refunds
+-- or reversals — standard convention in transaction data — not as errors,
+-- based on the value representing money flowing back to the customer
+-- rather than out.
+-- DECISION: Strip the $ and cast to NUMERIC. Sign is preserved deliberately
+-- — taking an absolute value would destroy real information about
+-- direction of funds, which is itself a meaningful signal for a
+-- fraud-detection-themed analysis.
+-- Final silver expression:
+--   CAST(TRIM(REPLACE(amount, '$', '')) AS NUMERIC) AS amount
+
+
+-- ----------------------------------------------------------------------------
+-- 4. use_chip — whitespace / formatting check
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT use_chip
+FROM bronze.transactions_data
+WHERE use_chip != TRIM(use_chip);
+
+-- RESULT: Empty. No leading/trailing whitespace found.
+-- DECISION: use_chip carries forward as TEXT, untouched.
+
+
+-- ----------------------------------------------------------------------------
+-- 5. merchant_id — numeric-format check
+-- ----------------------------------------------------------------------------
+
+SELECT merchant_id
+FROM bronze.transactions_data
+WHERE merchant_id !~ '^[0-9]+$';
+
+-- RESULT: Empty. Every value is composed entirely of digits.
+-- DECISION: Despite being all-digit, merchant_id stays TEXT — it is an
+-- identifier, not a numeric concept. No arithmetic is ever performed on a
+-- merchant ID, and casting to a number type risks silently dropping a
+-- leading zero with no warning if one exists elsewhere in the full dataset.
+
+
+-- ----------------------------------------------------------------------------
+-- 6. merchant_city / merchant_state — whitespace, nulls, ONLINE pattern, casing
+-- ----------------------------------------------------------------------------
+
+-- Whitespace check
+SELECT merchant_city
+FROM bronze.transactions_data
+WHERE merchant_city != TRIM(merchant_city);
+
+-- Null check
+SELECT COUNT(*)
+FROM bronze.transactions_data
+WHERE merchant_city IS NULL;
+
+-- Does merchant_city = 'ONLINE' correlate with use_chip = 'Online Transaction'?
+SELECT use_chip, COUNT(*)
+FROM bronze.transactions_data
+WHERE merchant_city = 'ONLINE'
+GROUP BY use_chip;
+
+SELECT use_chip, merchant_city, merchant_state
+FROM bronze.transactions_data
+WHERE use_chip = 'Online Transaction';
+
+-- Casing standardization preview
+SELECT
+    merchant_city,
+    CASE
+        WHEN UPPER(merchant_city) = 'ONLINE' THEN 'Online'
+        ELSE merchant_city
+    END AS single_value_fix,
+    INITCAP(merchant_city) AS general_fix
+FROM bronze.transactions_data;
+
+-- RESULT: No whitespace issues, no nulls in merchant_city. Online
+-- transactions consistently show merchant_city = 'ONLINE' paired with a
+-- NULL merchant_state — use_chip = 'Online Transaction' is the underlying
+-- signal already driving this pattern, so 'ONLINE' is redundant with
+-- information use_chip already carries, not a separate data quality issue.
+-- City names vary in casing (e.g. all-caps source values).
+--
+-- DECISION — merchant_city: apply INITCAP() across the whole column rather
+-- than special-casing just the 'ONLINE' value. This achieves the actual
+-- goal (consistent Title Case, no ALL CAPS) in one general-purpose
+-- expression instead of a one-off fix for a single string.
+-- Final silver expression:
+--   INITCAP(merchant_city) AS merchant_city
+--
+-- DECISION — merchant_state: left as raw NULL for online transactions, NOT
+-- converted to 'N/A' or any placeholder string. NULL is the accurate
+-- representation here (there genuinely is no state for an online
+-- transaction) and is handled correctly by GROUP BY / COUNT(*) without
+-- any special-casing. A placeholder string would need to be remembered
+-- and special-cased by every future query touching this column. If
+-- display-friendly text is ever needed, COALESCE(merchant_state, 'Online')
+-- belongs in the relevant gold-layer view, not baked into silver.
+-- Final silver expression:
+--   merchant_state  -- untouched
+
+
+-- ----------------------------------------------------------------------------
+-- 7. zip — float artifact from source
+-- ----------------------------------------------------------------------------
+
+SELECT
+    zip,
+    CAST(SPLIT_PART(zip, '.', 1) AS NUMERIC) AS zip_code
+FROM bronze.transactions_data;
+
+-- FINDING: Raw value carries a trailing ".0" artifact from the source
+-- (e.g. "58523.0"), a side effect of the file being exported with zip
+-- treated as a float upstream.
+-- DECISION: Strip the ".0" suffix using SPLIT_PART, but do NOT cast the
+-- result to NUMERIC. zip is not a numeric concept — no arithmetic is ever
+-- performed on it, and casting would silently drop a leading zero on any
+-- zip code that has one (e.g. Massachusetts, Connecticut, Puerto Rico).
+-- NUMERIC stores a value, not a string of characters, so a leading zero
+-- carries no special protection there — the same risk that applies to INT.
+-- Final silver expression:
+--   SPLIT_PART(zip, '.', 1) AS zip_code   -- stays TEXT
+
+
+-- ----------------------------------------------------------------------------
+-- 8. mcc — what it is, and how it should be typed
+-- ----------------------------------------------------------------------------
+
+SELECT mcc
+FROM bronze.transactions_data;
+
+-- BACKGROUND: MCC (Merchant Category Code) is a four-digit code, standardized
+-- under ISO 18245, that classifies a merchant by the type of goods or
+-- services it provides (e.g. drug stores, fast-food restaurants, office
+-- supply stores). It is a categorical identifier assigned by the card
+-- network / acquiring bank — not a quantity, and never used in arithmetic.
+-- DECISION: mcc stays TEXT, untouched — same reasoning as merchant_id and
+-- zip. A future gold-layer enrichment could join mcc against a public
+-- code-to-category lookup table for human-readable labels, but that is an
+-- enrichment step, not a silver cleaning step.
+
+
+-- ----------------------------------------------------------------------------
+-- 9. errors — comma-separated multi-value string (1NF violation)
+-- ----------------------------------------------------------------------------
+
+SELECT DISTINCT errors
+FROM bronze.transactions_data;
+
+-- FINDING: errors stores multiple discrete values jammed into a single
+-- comma-separated string per cell (e.g. "Bad CVV,Insufficient Balance").
+-- This violates First Normal Form — a column should hold one atomic value,
+-- not a list. As stored, a simple WHERE errors = 'Bad CVV' would miss every
+-- row where 'Bad CVV' appears combined with another error, making basic
+-- "how many transactions had X error" questions unreliable to answer.
+
+-- Split preview — one row per individual error, linked back to the
+-- transaction it belongs to
+SELECT
+    id AS transaction_id,
+    UNNEST(STRING_TO_ARRAY(TRIM(errors), ',')) AS errors_on_card
+FROM bronze.transactions_data
+WHERE errors IS NOT NULL;
+
+-- Boolean summary flag preview
+SELECT errors, errors IS NOT NULL AS is_error
+FROM bronze.transactions_data;
+
+-- DECISION: Normalize errors out of silver.transactions entirely, into a
+-- separate child table — silver.transaction_errors — with one row per
+-- (transaction_id, error_type) pair, built using STRING_TO_ARRAY +
+-- UNNEST. This is the textbook-correct fix and matches this project's
+-- stated goal of practicing true normalization with reliable keys.
+--
+-- silver.transactions itself does NOT keep the raw errors text column —
+-- carrying a duplicate copy of information that now lives properly
+-- normalized in silver.transaction_errors would itself be a normalization
+-- smell. The original raw string remains permanently available, untouched,
+-- in bronze.transactions_data.errors as the audit trail back to source.
+--
+-- A derived boolean flag IS kept directly on silver.transactions for cheap
+-- filtering without requiring a join to the child table:
+-- Final silver expression:
+--   errors IS NOT NULL AS had_errors
+
+
+-- ============================================================================
+-- SUMMARY — bronze.transactions_data → silver.transactions
+-- ============================================================================
+-- id              -> PRIMARY KEY, untouched
+-- date             -> TIMESTAMP, untouched (minute-level granularity documented)
+-- client_id        -> FOREIGN KEY -> silver.users.id, untouched
+-- card_id          -> FOREIGN KEY -> silver.cards.id, untouched
+-- amount           -> $ stripped, cast to NUMERIC, sign preserved
+-- use_chip         -> untouched (clean)
+-- merchant_id      -> untouched (not a numeric concept, stays TEXT)
+-- merchant_city    -> INITCAP() applied for consistent casing
+-- merchant_state   -> untouched, NULL preserved for online transactions
+-- zip              -> trailing ".0" stripped via SPLIT_PART, stays TEXT
+-- mcc              -> untouched (categorical code, stays TEXT)
+-- errors           -> removed from this table; normalized into
+--                      silver.transaction_errors (transaction_id, error_type)
+-- had_errors       -> new derived BOOLEAN flag, errors IS NOT NULL
+-- ============================================================================
