@@ -1,0 +1,93 @@
+-- ============================================================================
+-- SILVER TRANSFORMATION SOURCE — bronze.transactions_data -> silver.transactions
+-- ============================================================================
+-- This is the SELECT statement that populates silver.transactions. Every
+-- column below reflects a tested, documented decision — see
+-- transactions_data_quality_tests.sql for the full test history and
+-- reasoning behind each call.
+--
+-- Note: the original errors column is NOT carried into silver.transactions.
+-- It is normalized out into its own table, silver.transaction_errors
+-- (transaction_id, error_type), since it stored multiple comma-separated
+-- values in a single cell — a First Normal Form violation. See the
+-- companion transform script for that table. A derived had_errors boolean
+-- is kept here for cheap filtering without requiring a join.
+--
+-- This query is intended to run inside the silver load procedure as:
+--   INSERT INTO silver.transactions (...)
+--   SELECT ... (this query)
+--   FROM bronze.transactions_data;
+-- ============================================================================
+
+SELECT 
+    id,
+    -- Passed uniqueness check (no duplicates, no nulls) -> PRIMARY KEY in
+    -- silver.transactions
+
+    date,
+    -- Passed checks: no nulls, plausible range. Carries forward as
+    -- TIMESTAMP, untouched. Note: every row's seconds component is 0 —
+    -- true source granularity is minute-level, not second-level, despite
+    -- the TIMESTAMP type. Documented as a known precision limitation.
+
+    client_id,
+    -- Passed null check and orphan check (every client_id exists in
+    -- bronze.users_data) -> FOREIGN KEY -> silver.users.id
+
+    card_id,
+    -- Passed null check and orphan check (every card_id exists in
+    -- bronze.cards_data) -> FOREIGN KEY -> silver.cards.id
+
+    CAST(TRIM(REPLACE(amount, '$', '')) AS NUMERIC) AS amount,
+    -- Raw value has a literal $ prefix and can be negative (e.g. "$-77.00").
+    -- $ stripped and cast to NUMERIC. Sign is deliberately preserved —
+    -- negative values represent refunds/reversals (money flowing back to
+    -- the customer), a standard transaction-data convention, not an error
+    -- to correct. Taking an absolute value would destroy that signal.
+
+    use_chip,
+    -- Passed whitespace check. Carries forward as TEXT, untouched.
+
+    merchant_id,
+    -- Passed format check (entirely numeric characters). Stays TEXT,
+    -- untouched — an identifier, not a numeric concept. No arithmetic is
+    -- ever performed on it, and casting risks silently dropping a leading
+    -- zero with no warning.
+
+    INITCAP(merchant_city) AS merchant_city,
+    -- Source values vary in casing (some ALL CAPS). INITCAP applied across
+    -- the whole column for consistent Title Case, rather than special-
+    -- casing only the 'ONLINE' value. This also normalizes 'ONLINE' to
+    -- 'Online' as a side effect of the general fix.
+
+    merchant_state,
+    -- Left untouched, NULL preserved for online transactions. NULL is the
+    -- accurate representation (no physical state exists for an online
+    -- transaction) and is handled correctly by GROUP BY / COUNT(*) without
+    -- special-casing. Confirmed that 'ONLINE' merchant_city consistently
+    -- pairs with use_chip = 'Online Transaction', so no information is
+    -- lost by leaving this NULL rather than substituting a placeholder
+    -- like 'N/A'. Display-friendly text, if ever needed, belongs in a
+    -- gold-layer view via COALESCE(merchant_state, 'Online'), not baked
+    -- into silver.
+
+    SPLIT_PART(zip, '.', 1) AS zip_code,
+    -- Raw value carries a trailing ".0" artifact from the source (e.g.
+    -- "58523.0"), a side effect of zip being treated as a float upstream.
+    -- The suffix is stripped via SPLIT_PART, but the result is NOT cast to
+    -- NUMERIC — zip is not a numeric concept, and a numeric cast would
+    -- silently drop any leading zero (e.g. Massachusetts, Connecticut,
+    -- Puerto Rico zip codes). Stays TEXT.
+
+    mcc,
+    -- A four-digit Merchant Category Code (ISO 18245) classifying the
+    -- merchant's business type. A categorical identifier, not a quantity —
+    -- never summed or averaged. Stays TEXT, untouched.
+
+    errors IS NOT NULL AS had_errors
+    -- Derived BOOLEAN flag for cheap filtering ("did this transaction have
+    -- any error") without requiring a join to silver.transaction_errors.
+    -- The raw errors text itself is not carried into this table — see
+    -- note above.
+
+FROM bronze.transactions_data;
