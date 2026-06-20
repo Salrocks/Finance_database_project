@@ -21,3 +21,32 @@ year_pin_last_changed, --PASSED TEST
 card_on_dark_web -- passed test
 
 FROM bronze.cards_data
+
+
+
+
+
+transaction_data************
+
+SELECT 
+id, --passed test
+date, --passed test
+client_id, --passed test bronze.cards_data
+card_id, --passed test bronze.cards_data
+CAST(TRIM(REPLACE(amount, '$', '')) AS NUMERIC) AS amount, ------
+use_chip, --- passed test
+merchant_id, -- only number passed, test
+INITCAP(merchant_city) AS merchant_city,
+merchant_state,
+SPLIT_PART(zip, '.', 1) AS Zip_code,
+mcc,
+--errors,
+errors IS NOT NULL AS had_errors
+FROM bronze.transactions_data
+
+
+Error table ******
+-- Link between transaction error values and the list of them per trasnaction_id)
+
+SELECT id AS transaction_id , UNNEST(STRING_TO_ARRAY(TRIM(errors), ',')) AS errors_on_card
+FROM bronze.transactions_data
