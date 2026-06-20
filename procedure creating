@@ -1,0 +1,23 @@
+cards_ data *********
+
+SELECT 
+id, --pased check ( no duplicates, Primary Key)
+client_id, --passed check (every id has a client id, meaning every card has a owner)
+card_brand, -- passed checks ( unique values, no nulls and no unwanted space)
+card_type,  --passed unique test and unwanted space, keep as is
+card_number,  --passed test to check for standard number length and no duplicates
+CAST(SPLIT_PART(expires, '/', 1)AS INT) AS expire_month,
+CAST(SPLIT_PART(expires, '/', 2)AS INT) AS expire_year,
+cvv, --  leave as is, however there are vary legnth (1,2,3) but no manager upper head to confirm to standarize to 3 by adding leading 0s
+CASE has_chip
+	WHEN 'YES' THEN 'Yes'
+	ELSE 'No'
+END AS has_chip,
+num_cards_issued, -- PASSED TEST
+CAST(TRIM(REPLACE(credit_limit, '$', '')) AS NUMERIC) AS credit_limit,
+CAST(SPLIT_PART(acct_open_date, '/', 1) AS INT) AS acct_open_month,
+CAST(SPLIT_PART(acct_open_date, '/', 2) AS INT) AS acct_open_year,
+year_pin_last_changed, --PASSED TEST
+card_on_dark_web -- passed test
+
+FROM bronze.cards_data
