@@ -1,0 +1,83 @@
+-- ============================================================================
+-- SILVER TRANSFORMATION SOURCE — bronze.cards_data -> silver.cards
+-- ============================================================================
+-- This is the SELECT statement that populates silver.cards. Every column
+-- below reflects a tested, documented decision — see
+-- cards_data_quality_tests.sql for the full test history and reasoning
+-- behind each call.
+--
+-- This query is intended to run inside the silver load procedure as:
+--   INSERT INTO silver.cards (...)
+--   SELECT ... (this query)
+--   FROM bronze.cards_data;
+-- ============================================================================
+
+SELECT 
+    id,
+    -- Passed uniqueness check (no duplicates, no nulls) -> PRIMARY KEY in silver.cards
+
+    client_id,
+    -- Passed null check (every card has a client_id) and orphan check
+    -- (every client_id exists in bronze.users_data) -> FOREIGN KEY ->
+    -- silver.users.id
+
+    card_brand,
+    -- Passed checks: clean distinct values, no nulls, no unwanted
+    -- whitespace. Carries forward as TEXT, untouched.
+
+    card_type,
+    -- Passed checks: clean distinct values (Credit, Debit, Debit
+    -- (Prepaid)), no unwanted whitespace. Kept as a single TEXT column
+    -- rather than split into card_type + is_prepaid — the prepaid
+    -- distinction is a minor attribute, not a structurally important
+    -- dimension for this project's analytical goals.
+
+    card_number,
+    -- Passed checks: standard length consistent per card_brand, no
+    -- duplicates. Stays TEXT, untouched — not a numeric concept, no
+    -- arithmetic is ever performed on it, and casting risks losing
+    -- precision/leading digits.
+
+    CAST(SPLIT_PART(expires, '/', 1) AS INT) AS expire_month,
+    CAST(SPLIT_PART(expires, '/', 2) AS INT) AS expire_year,
+    -- Raw value is MM/YYYY text with no day component. Split into two
+    -- INT columns rather than parsed into a DATE, since constructing a
+    -- DATE would require fabricating a day value that was never present
+    -- in the source.
+
+    cvv,
+    -- Left as-is. Lengths vary (1, 2, or 3 digits), inconsistent with the
+    -- standard of 3 digits (Visa/Mastercard/Discover) or 4 digits (Amex).
+    -- No leading zero was added to standardize the length, because the
+    -- missing digit(s) cannot be recovered from the source data — padding
+    -- would fabricate data, not clean it. Escalated as a management-level
+    -- decision rather than resolved silently; full reasoning and the
+    -- rejected hypothetical (brand-aware LPAD) are documented in
+    -- cards_data_quality_tests.sql.
+
+    CASE WHEN has_chip = 'YES' THEN TRUE ELSE FALSE END AS has_chip,
+    -- Raw value was YES/NO text. Cast to BOOLEAN.
+
+    num_cards_issued,
+    -- Passed check: already a valid INT, no transformation needed.
+
+    CAST(TRIM(REPLACE(credit_limit, '$', '')) AS NUMERIC) AS credit_limit,
+    -- Raw value has a literal $ prefix. No comma thousands-separators
+    -- found, so the $ is stripped and the result cast to NUMERIC with no
+    -- risk of a failed cast or silent data loss.
+
+    CAST(SPLIT_PART(acct_open_date, '/', 1) AS INT) AS acct_open_month,
+    CAST(SPLIT_PART(acct_open_date, '/', 2) AS INT) AS acct_open_year,
+    -- Same MM/YYYY format and missing-day problem as expires. Same
+    -- resolution applied for consistency across both date-like columns —
+    -- split into INT columns rather than fabricating a day to build a
+    -- DATE.
+
+    year_pin_last_changed,
+    -- Passed check: already a valid INT, no transformation needed.
+
+    CASE WHEN card_on_dark_web = 'Yes' THEN TRUE ELSE FALSE END AS card_on_dark_web
+    -- Raw value was Yes/No text. Cast to BOOLEAN, same treatment as
+    -- has_chip.
+
+FROM bronze.cards_data;
