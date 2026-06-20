@@ -1,0 +1,139 @@
+-- ============================================================================
+-- SILVER LAYER LOAD PROCEDURE
+-- ============================================================================
+-- Finance Fraud Detection Pipeline
+--
+-- Loads all four silver tables from their bronze sources in a single call.
+-- Designed as a full refresh (truncate-and-reload), callable any time
+-- bronze data changes and silver needs to be rebuilt:
+--
+--   CALL silver.load_silver_tables();
+--
+-- Every transformation below reflects a tested, documented decision — see
+-- the companion *_data_quality_tests.sql files for the full reasoning
+-- behind each one.
+-- ============================================================================
+
+CREATE OR REPLACE PROCEDURE silver.load_silver_tables()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+
+    -- ------------------------------------------------------------------
+    -- CLEAR EXISTING DATA
+    -- ------------------------------------------------------------------
+    -- Foreign key relationships in this schema:
+    --   cards_data.client_id        -> users_data.id
+    --   transactions_data.client_id -> users_data.id
+    --   transactions_data.card_id   -> cards_data.id
+    --   transaction_errors.transaction_id -> transactions_data.id
+    --
+    -- A table cannot be truncated while another table still holds rows
+    -- referencing it via a FOREIGN KEY. CASCADE removes this restriction
+    -- by automatically truncating any dependent table as well, in the
+    -- correct order, in a single statement — Postgres resolves the
+    -- dependency chain internally rather than requiring each table to be
+    -- cleared by hand in strict child-before-parent order.
+    TRUNCATE TABLE silver.transaction_errors CASCADE;
+    TRUNCATE TABLE silver.transactions_data CASCADE;
+    TRUNCATE TABLE silver.cards_data CASCADE;
+    TRUNCATE TABLE silver.users_data CASCADE;
+
+    -- ------------------------------------------------------------------
+    -- 1. silver.users_data — no dependencies, must load first
+    -- ------------------------------------------------------------------
+    INSERT INTO silver.users_data (
+        id, current_age, retirement_age, birth_year, birth_month, gender,
+        address, latitude, longitude, per_capita_income, yearly_income,
+        total_debt, credit_score, num_credit_cards
+    )
+    SELECT
+        id,
+        current_age,                -- passed checks, already valid INT
+        retirement_age,             -- passed checks, already valid INT
+        birth_year,                 -- passed checks, already valid INT
+        birth_month,                -- passed checks, already valid INT
+        gender,                     -- passed checks, clean TEXT
+        address,                    -- passed checks, single atomic value, clean TEXT
+        latitude,                   -- passed checks, stays TEXT (not a numeric concept)
+        longitude,                  -- passed checks, stays TEXT (not a numeric concept)
+        CAST(TRIM(REPLACE(per_capita_income, '$', '')) AS NUMERIC),
+        CAST(TRIM(REPLACE(yearly_income, '$', '')) AS NUMERIC),
+        CAST(TRIM(REPLACE(total_debt, '$', '')) AS NUMERIC),
+        credit_score,                -- passed checks, already valid INT
+        num_credit_cards             -- passed checks, already valid INT
+    FROM bronze.users_data;
+
+    -- ------------------------------------------------------------------
+    -- 2. silver.cards_data — depends on silver.users_data (client_id FK)
+    -- ------------------------------------------------------------------
+    INSERT INTO silver.cards_data (
+        id, client_id, card_brand, card_type, card_number, expire_month,
+        expire_year, cvv, has_chip, num_cards_issued, credit_limit,
+        acct_open_month, acct_open_year, year_pin_last_changed,
+        card_on_dark_web
+    )
+    SELECT
+        id,
+        client_id,
+        card_brand,                  -- passed checks, clean TEXT
+        card_type,                   -- passed checks, kept as single column (not split for prepaid)
+        card_number,                 -- passed checks, stays TEXT (not a numeric concept)
+        CAST(SPLIT_PART(expires, '/', 1) AS INT),   -- MM/YYYY split, no day fabricated
+        CAST(SPLIT_PART(expires, '/', 2) AS INT),
+        cvv,                          -- left as-is; length inconsistency documented, no padding applied
+        CASE WHEN has_chip = 'YES' THEN TRUE ELSE FALSE END,
+        num_cards_issued,             -- passed checks, already valid INT
+        CAST(TRIM(REPLACE(credit_limit, '$', '')) AS NUMERIC),
+        CAST(SPLIT_PART(acct_open_date, '/', 1) AS INT),  -- same MM/YYYY split treatment as expires
+        CAST(SPLIT_PART(acct_open_date, '/', 2) AS INT),
+        year_pin_last_changed,        -- passed checks, already valid INT
+        CASE WHEN card_on_dark_web = 'Yes' THEN TRUE ELSE FALSE END
+    FROM bronze.cards_data;
+
+    -- ------------------------------------------------------------------
+    -- 3. silver.transactions_data — depends on silver.users_data and silver.cards_data
+    -- ------------------------------------------------------------------
+    INSERT INTO silver.transactions_data (
+        id, date, client_id, card_id, amount, use_chip, merchant_id,
+        merchant_city, merchant_state, zip_code, mcc, had_errors
+    )
+    SELECT
+        id,
+        date,                         -- passed checks, stays TIMESTAMP (minute-level granularity documented)
+        client_id,
+        card_id,
+        CAST(TRIM(REPLACE(amount, '$', '')) AS NUMERIC),  -- sign preserved: negative = refund/reversal
+        use_chip,                     -- passed checks, clean TEXT
+        merchant_id,                  -- passed checks, stays TEXT (not a numeric concept)
+        INITCAP(merchant_city),       -- standardizes casing across the whole column
+        merchant_state,               -- left as-is; NULL preserved for online transactions
+        SPLIT_PART(zip, '.', 1),      -- strips trailing ".0" artifact, stays TEXT
+        mcc,                          -- categorical merchant code, stays TEXT
+        errors IS NOT NULL            -- derived boolean flag for cheap filtering
+    FROM bronze.transactions_data;
+
+    -- ------------------------------------------------------------------
+    -- 4. silver.transaction_errors — depends on silver.transactions_data
+    -- ------------------------------------------------------------------
+    -- The original errors column stored multiple comma-separated values
+    -- in a single cell (a First Normal Form violation). Split via
+    -- STRING_TO_ARRAY + UNNEST into one row per (transaction_id,
+    -- error_type) pair.
+    INSERT INTO silver.transaction_errors (transaction_id, error_type)
+    SELECT
+        id,
+        TRIM(UNNEST(STRING_TO_ARRAY(errors, ',')))
+    FROM bronze.transactions_data
+    WHERE errors IS NOT NULL;
+
+END;
+$$;
+
+-- ----------------------------------------------------------------------------
+-- USAGE
+-- ----------------------------------------------------------------------------
+-- Run once to build the silver layer, and again any time bronze is reloaded:
+--
+--   CALL silver.load_silver_tables();
+-- ============================================================================
