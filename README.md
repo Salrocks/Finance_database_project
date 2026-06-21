@@ -2,11 +2,9 @@
 
 This project builds a complete PostgreSQL data pipeline around a credit card transaction dataset, using a Bronze → Silver → Gold layered architecture to take three raw, related CSV files and turn them into a clean, validated, query-ready relational database.
 
-The source data — customer profiles, card details, and transaction history — comes from the [Credit Card Transactions Fraud Detection Dataset](https://www.kaggle.com/datasets/computingvictor/transactions-fraud-datasets) on Kaggle. What makes this dataset a good fit for this kind of project is that it's already relational: customers, cards, and transactions are connected through real, verifiable keys, rather than arriving as a single flat table. That structure makes it possible to practice genuine normalization — building separate, properly keyed tables instead of forcing everything into one — and to validate every relationship with actual SQL checks rather than assuming the source data is trustworthy.
+The source data — customer profiles, card details, and transaction history — comes from the [Credit Card Transactions Fraud Detection Dataset](https://www.kaggle.com/datasets/computingvictor/transactions-fraud-datasets) on Kaggle. What makes this dataset a good fit for this kind of project is that it's already relational: customers, cards, and transactions are connected through real, verifiable keys, rather than arriving as a single flat table.
 
 The pipeline moves through three distinct stages. **Bronze** loads the raw CSVs into Postgres exactly as they are, with no cleaning and no enforced constraints — its only job is to faithfully mirror the source, flaws included. **Silver** takes that raw data and applies real transformation logic: stripping currency symbols, breaking apart malformed date strings, converting text flags into proper booleans, fixing a column that violated basic normalization rules, and — only once uniqueness and referential integrity were explicitly confirmed — adding real primary and foreign key constraints. **Gold** sits on top of the validated silver tables as a set of analytical views, each one built to answer a specific question about spending behavior, merchant patterns, and fraud-relevant anomalies, using aggregation, window functions, CTEs, and time-series logic.
-
-Throughout the build, the goal was to treat every non-obvious decision as a decision — testing assumptions before acting on them, documenting the reasoning behind each typing and cleaning choice, and explicitly flagging the handful of cases where no clean technical answer existed and a judgment call had to be made instead.
 
 ---
 
@@ -17,7 +15,7 @@ Throughout the build, the goal was to treat every non-obvious decision as a deci
 - **Source data:** Kaggle — [`computingvictor/transactions-fraud-datasets`](https://www.kaggle.com/datasets/computingvictor/transactions-fraud-datasets)
 - **Version control:** GitHub
 
-The dataset arrives as three separate CSV files — customer profiles, card details, and transaction history — connected through shared identifiers (`client_id`, `card_id`) rather than as a single combined export. That structure is what made it possible to build out a proper multi-table schema instead of a single flat table, and it's reflected in how the project is organized: each layer of the pipeline (bronze, silver, gold) lives in its own Postgres schema, with dedicated setup and load scripts per layer rather than one monolithic script handling everything.
+The dataset arrives as three separate CSV files — customer profiles, card details, and transaction history — connected through shared identifiers (`client_id`, `card_id`). That structure is what made it possible to build out a proper multi-table schema instead of a single flat table, and it's reflected in how the project is organized: each layer of the pipeline (bronze, silver, gold) lives in its own Postgres schema, with dedicated setup and load scripts per layer rather than one monolithic script handling everything.
 
 ---
 
@@ -25,7 +23,7 @@ The dataset arrives as three separate CSV files — customer profiles, card deta
 
 ### What changes at each stage
 
-**Bronze** is an unaltered, column-for-column mirror of the three source CSVs. No keys are enforced and no values are reformatted — every column defaults to `TEXT` unless the raw value is already valid input for a native type with no changes required. This is a deliberate constraint, not an oversight: a `PRIMARY KEY` or `FOREIGN KEY` actively rejects rows that violate it, and bronze's job is to accept the source exactly as delivered, including any flaws it contains. For example, `credit_limit` arrives as `"$24295"` — a string, not a number — and is loaded into bronze exactly as written:
+**Bronze** is an unaltered, column-for-column mirror of the three source CSVs. No keys are enforced and no values are reformatted — every column defaults to `TEXT` unless the raw value is already valid input for a native type with no changes required. This is a deliberate constraint, a `PRIMARY KEY` or `FOREIGN KEY` actively rejects rows that violate it, and bronze's job is to accept the source exactly as delivered, including any flaws it contains. For example, `credit_limit` arrives as `"$24295"` — a string, not a number — and is loaded into bronze exactly as written:
 
 ```sql
 CREATE TABLE bronze.cards_data (
@@ -68,7 +66,7 @@ CREATE TABLE silver.cards_data (
 
 ### How the silver tables relate to each other
 
-The three source files map naturally onto a dimension/fact pattern, and that mapping was confirmed with actual SQL checks — uniqueness tests and orphan checks — rather than taken on faith:
+The three source files map naturally onto a dimension/fact pattern, and that mapping was confirmed with actual SQL checks — uniqueness tests and orphan checks.
 
 ```
 silver.users_data  (id PK)
@@ -128,17 +126,13 @@ Every column defaults to `TEXT`. A column only gets a native type if the raw tex
 
 ## 🥉 Bronze Layer
 
-**What came in:** `users_data.csv`, `cards_data.csv`, `transactions_data.csv`, already linked by real keys rather than something that had to be inferred.
+**What came in:** `users_data.csv`, `cards_data.csv`, `transactions_data.csv`
 
 **Setting up the schemas:** all three schemas get dropped and recreated together at the start of the build (`DROP SCHEMA IF EXISTS ... CASCADE`, then `CREATE SCHEMA`). This is meant to be run repeatedly during development without leaving behind partial state from a prior attempt — it works because the source files are a fixed snapshot, not something that grows over time. This same approach would be the wrong call in a system where new data arrives continuously; that kind of pipeline needs an append-only design instead, with audit columns like `source_file`/`ingested_at` and an `INSERT ... ON CONFLICT DO NOTHING` to avoid reloading the same row twice.
-
-**The typing rule:** default to `TEXT`; only use a native type when the source value needs zero changes to be valid in that type. That single rule is why `card_number`, `cvv`, `zip`, `merchant_id`, and `mcc` are all `TEXT` even though every character in them is a digit — none of them represent a quantity, so there's nothing to gain from a numeric type and a real risk of losing a leading zero if cast.
 
 **Getting the data in:** plain `COPY ... DELIMITER ',' CSV HEADER`, no cleanup applied during the load itself.
 
 **Checking it landed correctly:** confirmed row counts were non-zero across all three tables, confirmed `amount` still carried its `$` prefix unchanged, and confirmed `date` parsed into a real `TIMESTAMP` — though it later turned out every single value had `:00` seconds, more on that below.
-
-📄 [`/scripts/bronze_layer/bronze_setup.sql`](./scripts/bronze_layer/bronze_setup.sql)
 
 ---
 
@@ -154,13 +148,9 @@ What turned up:
 - **`date` only has minute-level resolution.** Every timestamp ends in `:00` seconds with no exceptions — the column is typed `TIMESTAMP`, but the underlying data was never recorded down to the second. Noted as a limitation of the source, not something to repair.
 - **`zip` had a leftover `.0`** from being stored as a float somewhere upstream. Removed with `SPLIT_PART`, but the result stays `TEXT` rather than being cast to a number, for the same leading-zero reason as everything else.
 
-📄 [`cards_data_quality_tests.sql`](./scripts/testing/cards_data_quality_tests.sql) · [`transactions_data_quality_tests.sql`](./scripts/testing/transactions_data_quality_tests.sql) · [`users_data_quality_tests.sql`](./scripts/testing/users_data_quality_tests.sql)
-
 ---
 
 ## 🥈 Silver Layer
-
-This is where every fix that bronze deliberately skipped actually happens:
 
 - **Currency columns** (`credit_limit`, `amount`, `per_capita_income`, `yearly_income`, `total_debt`) — the `$` is stripped and the result cast to `NUMERIC`. `FLOAT` was ruled out (rounding drift), and a fixed-scale `DECIMAL` was ruled out too, since no consistent scale was confirmed across every row. `amount` keeps its sign — a negative value means a refund or reversal, which matters for fraud analysis and shouldn't be flattened away.
 - **`MM/YYYY` date strings** (`expires`, `acct_open_date`) — broken into separate `*_month` and `*_year` integer columns instead of forced into a `DATE`, since a real date would need a day value that the source never provided.
@@ -175,8 +165,6 @@ A single stored procedure, `silver.load_silver_tables()`, handles all four table
 CALL silver.load_silver_tables();
 ```
 
-📄 [`/scripts/silver_layer/silver_setup.sql`](./scripts/silver_layer/silver_setup.sql)
-
 ---
 
 ## 🥇 Gold Layer
@@ -190,24 +178,20 @@ Each one is built as a view rather than a table, so it always reflects the curre
 - **`gold.merchant_state_error_rate`** computes the overall error rate once in a CTE, then safely cross-joins it against the full table — safe specifically because the CTE always produces exactly one row, so the join doesn't multiply the row count.
 - **`gold.customer_outlier_transactions`** uses a self-relative threshold (5x a customer's *own* average) rather than a fixed dollar amount, so the same logic works fairly across customers with very different normal spending levels — directly tied to the dataset's fraud-detection theme.
 
-A few decisions remain open rather than fully resolved: whether "total spend" across several views should reflect net flow (refunds included) or gross charges, and how the running-total view should treat multiple transactions from the same customer that land in the same minute.
-
-📄 [`/scripts/gold_layer/gold_views.sql`](./scripts/gold_layer/gold_views.sql)
-
 ---
 
 ## ✅ Summary — End-to-End Pipeline
 
 ```sql
 -- 1. Bronze: schemas + raw load
-\i scripts/bronze_layer/bronze_setup.sql
+ scripts/bronze_layer
 
 -- 2. Silver: table structure + full refresh
-\i scripts/silver_layer/silver_setup.sql
+\i Procedures/silver.load_silver_tables
 CALL silver.load_silver_tables();
 
 -- 3. Gold: analytical views
-\i scripts/gold_layer/gold_views.sql
+\i scripts/gold/analytical_views
 ```
 
 Once all three layers are built, refreshing the entire analytical layer after any bronze data change requires only one call:
@@ -221,5 +205,3 @@ Every gold view reads from the refreshed silver tables automatically, since view
 This project moved through the same discipline at every stage: confirm before transforming, transform before constraining, and document the calls that didn't have a clean technical answer rather than letting them slide by unnoticed. The dataset's reliable keys made genuine normalization possible — a customer dimension, a card dimension, a transaction fact table, and a properly split-out error table — validated with actual queries at each step rather than assumed from the dataset's description. The result is a small but complete pipeline: raw CSVs in, eight fraud-relevant analytical views out, with every transformation and every judgment call along the way traceable back to a specific test and a specific decision.
 
 ---
-
-Scripts referenced throughout this document live under [`/scripts`](./scripts): `/scripts/bronze_layer`, `/scripts/silver_layer`, `/scripts/testing`, `/scripts/gold_layer`.
