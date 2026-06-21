@@ -1,0 +1,216 @@
+-- ============================================================================
+-- GOLD LAYER — Analytical Views
+-- ============================================================================
+-- Finance Fraud Detection Pipeline
+--
+-- Each view below answers one analytical question against the validated
+-- silver tables. Views (not tables) are used deliberately: a view stores no
+-- data of its own — every query against it re-runs the underlying SELECT
+-- against the current state of silver.*. This means refreshing silver via
+-- CALL silver.load_silver_tables() automatically updates every gold view's
+-- results, with no separate gold-layer refresh step required.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- 1. mcc_spend_summary
+-- ----------------------------------------------------------------------------
+-- Question: What is the total and average transaction amount per merchant
+-- category (mcc)?
+--
+-- Groups every transaction by its merchant category code and computes both
+-- the average transaction size and the total dollar amount per category.
+-- SUM(amount) reflects NET spend per category, since refund/reversal
+-- transactions carry a negative amount and offset positive charges within
+-- the same group — this was a deliberate decision, not an oversight.
+CREATE OR REPLACE VIEW gold.mcc_spend_summary AS
+SELECT 
+    mcc, 
+    ROUND(AVG(amount), 2) AS avg_per_transaction,
+    ROUND(SUM(amount), 2) AS sum_total_transactions
+FROM silver.transactions_data
+GROUP BY mcc;
+
+
+-- ----------------------------------------------------------------------------
+-- 2. top_spenders_ranked
+-- ----------------------------------------------------------------------------
+-- Question: Which customers have the highest total spend, and where do they
+-- rank relative to everyone else?
+--
+-- The inner subquery collapses every transaction down to one row per
+-- customer, summing their total spend. The outer query then applies two
+-- window functions across that customer-level result: RANK() gives a clean
+-- 1st/2nd/3rd-place ordering (with ties sharing a rank), and PERCENT_RANK()
+-- expresses the same ordering as a percentile (0 = top spender, approaching
+-- 1 = lowest). Ranking happens AFTER aggregation, not on individual
+-- transactions, since the question is about customer totals, not single
+-- transaction amounts. Limited to the top 50 customers by spend.
+CREATE OR REPLACE VIEW gold.top_spenders_ranked AS
+SELECT t.*,
+    RANK() OVER (ORDER BY t.sum_amount DESC) AS spend_rank,
+    PERCENT_RANK() OVER (ORDER BY t.sum_amount DESC) AS percent_rank
+FROM (
+    SELECT client_id, SUM(amount) AS sum_amount
+    FROM silver.transactions_data
+    GROUP BY client_id
+) AS t
+ORDER BY spend_rank
+LIMIT 50;
+
+
+-- ----------------------------------------------------------------------------
+-- 3. monthly_transaction_trend
+-- ----------------------------------------------------------------------------
+-- Question: What does month-over-month transaction volume and total dollar
+-- amount look like over time?
+--
+-- DATE_TRUNC('month', date) collapses every transaction's timestamp down to
+-- the first day of its month WHILE KEEPING THE YEAR attached — critical,
+-- since the dataset spans multiple years and grouping by month number alone
+-- would incorrectly merge every January across every year into one row.
+-- COUNT(*) gives transaction volume per month; SUM(amount) gives the net
+-- dollar total. Ordered chronologically so the result reads as an actual
+-- trend over time, not an unordered list.
+CREATE OR REPLACE VIEW gold.monthly_transaction_trend AS
+SELECT 
+    DATE_TRUNC('month', date) AS month,
+    SUM(amount) AS month_amount,
+    COUNT(*) AS transaction_volume
+FROM silver.transactions_data
+GROUP BY DATE_TRUNC('month', date)
+ORDER BY month;
+
+
+-- ----------------------------------------------------------------------------
+-- 4. customer_running_total
+-- ----------------------------------------------------------------------------
+-- Question: For each customer, what's their running total spend over time?
+--
+-- Unlike the ranking view above, this keeps every individual transaction row
+-- rather than collapsing to one row per customer, since the question asks
+-- for the cumulative total AT EACH POINT IN TIME, not a single final figure.
+-- SUM(amount) OVER (PARTITION BY client_id ORDER BY date) restarts the
+-- running total at zero for every new customer and accumulates forward in
+-- date order. Note: the default window frame (RANGE, not ROWS) treats
+-- same-timestamp transactions from the same customer as tied peers that
+-- accumulate together rather than strictly in sequence — relevant here since
+-- transaction timestamps are only minute-precise, so same-minute ties from
+-- one customer are possible.
+CREATE OR REPLACE VIEW gold.customer_running_total AS
+SELECT client_id, amount, date,
+    SUM(amount) OVER (PARTITION BY client_id ORDER BY date) AS client_sum
+FROM silver.transactions_data;
+
+
+-- ----------------------------------------------------------------------------
+-- 5. merchant_state_error_rate
+-- ----------------------------------------------------------------------------
+-- Question: What proportion of transactions per merchant state had an
+-- error, and how does that compare to the overall error rate?
+--
+-- The "overall" CTE computes a single error-rate figure across the entire
+-- transactions table, with no grouping. COUNT(*) FILTER (WHERE had_errors)
+-- counts only rows flagged TRUE, divided by total row count, expressed as a
+-- percentage. Because that CTE always produces exactly one row, it can be
+-- safely CROSS JOINed against the full transactions table without
+-- multiplying row counts — every row simply gets that single overall figure
+-- attached, which then survives the GROUP BY merchant_state below it.
+-- merchant_state is NULL for online transactions by design (see silver
+-- layer notes); this view will surface a row with merchant_state = NULL
+-- representing the error rate specifically among online transactions.
+CREATE OR REPLACE VIEW gold.merchant_state_error_rate AS
+WITH overall AS (
+    SELECT 
+        ROUND(100.0 * COUNT(*) FILTER (WHERE had_errors) / COUNT(*), 2) AS overall_error_rate
+    FROM silver.transactions_data
+)
+SELECT 
+    t.merchant_state,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE t.had_errors) / COUNT(*), 2) AS state_error_rate,
+    o.overall_error_rate
+FROM silver.transactions_data t
+CROSS JOIN overall o
+GROUP BY t.merchant_state, o.overall_error_rate
+ORDER BY state_error_rate DESC;
+
+
+-- ----------------------------------------------------------------------------
+-- 6. card_brand_type_avg_amount
+-- ----------------------------------------------------------------------------
+-- Question: Which card_brand/card_type combinations are associated with the
+-- highest average transaction amount?
+--
+-- Joins transactions to cards on card_id to bring card_brand and card_type
+-- into the same result set, then groups by BOTH columns together as a
+-- combination (e.g. "Visa + Debit" vs. "Visa + Credit" are reported
+-- separately), since the question asks about the pairing, not either
+-- dimension alone.
+CREATE OR REPLACE VIEW gold.card_brand_type_avg_amount AS
+SELECT 
+    c.card_brand,
+    c.card_type,
+    ROUND(AVG(t.amount), 2) AS avg_transaction_amount,
+    COUNT(*) AS transaction_count
+FROM silver.transactions_data t
+JOIN silver.cards_data c ON t.card_id = c.id
+GROUP BY c.card_brand, c.card_type
+ORDER BY avg_transaction_amount DESC;
+
+
+-- ----------------------------------------------------------------------------
+-- 7. customer_activity_span
+-- ----------------------------------------------------------------------------
+-- Question: For each customer, what's the gap between their first and most
+-- recent transaction, and how does that relate to their total transaction
+-- count?
+--
+-- MIN(date) and MAX(date) per customer mark the boundaries of their activity
+-- window. Subtracting two TIMESTAMP values in Postgres returns an INTERVAL
+-- (expressed in days/hours/minutes), giving the gap directly without manual
+-- date-math conversion. transaction_count sits alongside the span so a
+-- long-active but infrequent customer can be distinguished from a
+-- long-active, high-frequency one — both could have the same span length
+-- with very different underlying behavior.
+CREATE OR REPLACE VIEW gold.customer_activity_span AS
+SELECT
+    client_id,
+    MIN(date) AS first_transaction,
+    MAX(date) AS most_recent_transaction,
+    MAX(date) - MIN(date) AS active_span,
+    COUNT(*) AS transaction_count
+FROM silver.transactions_data
+GROUP BY client_id
+ORDER BY active_span DESC;
+
+
+-- ----------------------------------------------------------------------------
+-- 8. customer_outlier_transactions
+-- ----------------------------------------------------------------------------
+-- Question: Using a CTE, identify customers whose single largest
+-- transaction is more than 5x their average transaction amount.
+--
+-- The customer_avg CTE collapses each customer's full transaction history
+-- down to two figures: their average transaction amount and their single
+-- largest transaction. The outer query filters to only customers whose max
+-- transaction exceeds 5x their own average — a SELF-RELATIVE threshold
+-- rather than a fixed dollar amount, so it scales naturally across
+-- customers with very different normal spending levels. This is the most
+-- directly fraud-relevant view in the gold layer: a transaction far outside
+-- someone's own typical pattern is a standard signal real fraud-detection
+-- systems screen for.
+CREATE OR REPLACE VIEW gold.customer_outlier_transactions AS
+WITH customer_avg AS (
+    SELECT
+        client_id,
+        AVG(amount) AS avg_amount,
+        MAX(amount) AS max_amount
+    FROM silver.transactions_data
+    GROUP BY client_id
+)
+SELECT
+    client_id,
+    avg_amount,
+    max_amount
+FROM customer_avg
+WHERE max_amount > 5 * avg_amount;
