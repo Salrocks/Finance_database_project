@@ -187,11 +187,11 @@ Each one is built as a view rather than a table, so it always reflects the curre
  scripts/bronze_layer
 
 -- 2. Silver: table structure + full refresh
-\i Procedures/silver.load_silver_tables
-CALL silver.load_silver_tables();
+  Procedures/silver.load_silver_tables
+  CALL silver.load_silver_tables();
 
 -- 3. Gold: analytical views
-\i scripts/gold/analytical_views
+  scripts/gold/analytical_views
 ```
 
 Once all three layers are built, refreshing the entire analytical layer after any bronze data change requires only one call:
@@ -199,9 +199,3 @@ Once all three layers are built, refreshing the entire analytical layer after an
 ```sql
 CALL silver.load_silver_tables();
 ```
-
-Every gold view reads from the refreshed silver tables automatically, since views recompute their query on every access rather than storing a static snapshot — there's nothing to manually rebuild downstream of silver.
-
-This project moved through the same discipline at every stage: confirm before transforming, transform before constraining, and document the calls that didn't have a clean technical answer rather than letting them slide by unnoticed. The dataset's reliable keys made genuine normalization possible — a customer dimension, a card dimension, a transaction fact table, and a properly split-out error table — validated with actual queries at each step rather than assumed from the dataset's description. The result is a small but complete pipeline: raw CSVs in, eight fraud-relevant analytical views out, with every transformation and every judgment call along the way traceable back to a specific test and a specific decision.
-
----
